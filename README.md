@@ -112,12 +112,12 @@ The script generates a CSV file (`results.csv`) with the following columns:
 
 ## Contributing
 
-Feel free to submit issues, fork the repository, and create pull requests for any improvements.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-## License
+## Licensing
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
 
-## Disclaimer
+## Legal disclaimer
 
-This tool is for educational and research purposes only. Users are responsible for ensuring they have permission to scan target systems and comply with all applicable laws and regulations. 
+Usage of this tool to interact with targets without prior mutual consent is illegal. It's the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program. Only use for educational purposes.
