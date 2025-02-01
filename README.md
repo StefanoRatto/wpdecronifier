@@ -11,6 +11,8 @@ This utility scans for WordPress sites exposed to the internet and checks if the
 - Multi-threaded scanning for improved performance
 - SSL verification disabled to handle self-signed certificates
 - Live progress tracking with timestamps
+- Configurable result limits via command-line arguments
+- Domain name resolution for IP addresses
 - Cool ASCII art banner
 - HackerOne API authentication support
 
@@ -59,21 +61,37 @@ chmod +x wpdecronifier
 ```
 
 Run the script:
+
+1. Without arguments (unlimited results):
 ```bash
 ./wpdecronifier
 ```
 
+2. With a result limit (e.g., first 100 results):
+```bash
+./wpdecronifier 100
+```
+
+3. With a larger result limit (e.g., first 1000 results):
+```bash
+./wpdecronifier 1000
+```
+
 The script will:
 1. Display a cool ASCII art banner
-2. Search for WordPress sites using Shodan
-3. Check each site for exposed wp-cron.php endpoints
-4. Cross-reference findings with HackerOne programs (if credentials are provided)
-5. Save results to `results.csv`
+2. Search for WordPress sites using Shodan (respecting the specified result limit)
+3. Attempt to resolve domain names for IP addresses
+4. Check each site for exposed wp-cron.php endpoints
+5. Cross-reference findings with HackerOne programs (if credentials are provided)
+6. Save results to `results.csv`
 
 ## Output
 
 The script generates a CSV file (`results.csv`) with the following columns:
-- WordPress Site: The URL of the WordPress site with exposed wp-cron.php
+- URL: The URL of the WordPress site
+- Domain: The resolved domain name (if available)
+- Vulnerable: Whether wp-cron.php is exposed
+- Checked At: Timestamp of when the check was performed
 - HackerOne Program: The URL of the corresponding HackerOne program
 
 ## Security Considerations
@@ -96,10 +114,10 @@ The script generates a CSV file (`results.csv`) with the following columns:
 
 Feel free to submit issues, fork the repository, and create pull requests for any improvements.
 
-## Licensing
+## License
 
-The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Legal disclaimer
+## Disclaimer
 
-Usage of this tool to interact with targets without prior mutual consent is illegal. It's the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program. Only use for educational purposes.
+This tool is for educational and research purposes only. Users are responsible for ensuring they have permission to scan target systems and comply with all applicable laws and regulations. 

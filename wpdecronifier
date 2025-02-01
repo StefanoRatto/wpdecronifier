@@ -17,6 +17,7 @@ import csv
 import os
 import urllib3
 import time
+import sys
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Optional, Union
@@ -33,14 +34,16 @@ class WordPressCronScanner:
     and cross-references them with HackerOne bug bounty programs.
     """
 
-    def __init__(self, shodan_api_key: str):
+    def __init__(self, shodan_api_key: str, result_limit: Optional[int] = None):
         """
         Initialize the scanner with necessary API keys and configurations.
         
         Args:
             shodan_api_key (str): API key for Shodan.io
+            result_limit (Optional[int]): Maximum number of results to process (None for unlimited)
         """
         self.shodan_api = shodan.Shodan(shodan_api_key)
+        self.result_limit = result_limit
         self.session = requests.Session()
         # Disable SSL verification for handling self-signed certificates
         self.session.verify = False
@@ -139,6 +142,8 @@ class WordPressCronScanner:
         wordpress_sites = set()  # Using a set to avoid duplicates
         try:
             print("\n[+] Initiating Shodan search for WordPress sites...")
+            if self.result_limit:
+                print(f"[+] Result limit set to: {self.result_limit}")
             
             queries = [
                 'http.component:wordpress',
@@ -151,7 +156,7 @@ class WordPressCronScanner:
             for query in queries:
                 try:
                     print(f"[+] Searching Shodan with query: {query}")
-                    results = self.shodan_api.search(query, limit=100)
+                    results = self.shodan_api.search(query, limit=min(100, self.result_limit) if self.result_limit else 100)
                     
                     if not results.get('matches'):
                         print(f"[*] No results for query: {query}")
@@ -166,8 +171,8 @@ class WordPressCronScanner:
                             status = f"domain {domain}" if domain else "IP only"
                             print(f"[+] Found WordPress site: {url} ({status})")
                     
-                    if len(wordpress_sites) >= 100:
-                        print(f"\n[+] Reached limit of {len(wordpress_sites)} sites, stopping search")
+                    if self.result_limit and len(wordpress_sites) >= self.result_limit:
+                        print(f"\n[+] Reached limit of {self.result_limit} sites, stopping search")
                         break
                         
                     time.sleep(1)
@@ -323,6 +328,18 @@ def main():
     Main entry point of the script.
     Handles initialization and execution of the scanner.
     """
+    # Parse command line arguments
+    result_limit = None
+    if len(sys.argv) > 1:
+        try:
+            result_limit = int(sys.argv[1])
+            if result_limit <= 0:
+                print("[-] Error: Result limit must be a positive number")
+                return
+        except ValueError:
+            print("[-] Error: Result limit must be a valid number")
+            return
+
     # Check for required API key
     shodan_api_key = os.getenv('SHODAN_API_KEY')
     if not shodan_api_key:
@@ -332,7 +349,7 @@ def main():
 
     # Initialize and run scanner
     try:
-        scanner = WordPressCronScanner(shodan_api_key)
+        scanner = WordPressCronScanner(shodan_api_key, result_limit)
         scanner.scan_and_save()
     except KeyboardInterrupt:
         print("\n[-] Scan interrupted by user")
