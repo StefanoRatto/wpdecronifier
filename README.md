@@ -4,23 +4,21 @@ This utility scans for WordPress sites exposed to the internet and checks if the
 
 ## Features
 
-- Searches for WordPress sites using Shodan API
-- Checks for exposed wp-cron.php endpoints
-- Cross-references findings with HackerOne public programs
-- Outputs results in CSV format
-- Multi-threaded scanning for improved performance
-- SSL verification disabled to handle self-signed certificates
-- Live progress tracking with timestamps
-- Configurable result limits via command-line arguments
-- Domain name resolution for IP addresses
+- Searches for WordPress sites using Shodan API (with pagination)
+- Checks for exposed wp-cron.php endpoints (only considers 200 OK responses as vulnerable)
+- Cross-references findings with HackerOne public programs (with pagination)
+- Outputs results in CSV format with timestamped filenames
+- Comprehensive logging with both console output and log files
+- Reverse DNS lookups for IP addresses
 - Cool ASCII art banner
-- HackerOne API authentication support
+- Environment variable validation
+- Configurable result limits via command-line arguments
 
 ## Prerequisites
 
 - Python 3.6 or higher
 - Shodan API key (sign up at https://shodan.io)
-- HackerOne account and API token (for program matching)
+- HackerOne account and API token (required for program matching)
 
 ## Installation
 
@@ -30,21 +28,25 @@ git clone https://github.com/yourusername/wpdecronifier.git
 cd wpdecronifier
 ```
 
-2. Install required dependencies:
+2. Create and activate a virtual environment (recommended):
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install required dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Set up your API credentials as environment variables:
+4. Set up your API credentials as environment variables:
 
-For Shodan (required):
 ```bash
+# Shodan API Key (required)
 export SHODAN_API_KEY='your-api-key-here'
-```
 
-For HackerOne (optional, but recommended for program matching):
-```bash
-export H1_API_TOKEN='your-api-token-here'
+# HackerOne credentials (required)
+export H1_TOKEN='your-api-token-here'
 export H1_USERNAME='your-username-here'
 ```
 
@@ -72,27 +74,30 @@ Run the script:
 ./wpdecronifier 100
 ```
 
-3. With a larger result limit (e.g., first 1000 results):
-```bash
-./wpdecronifier 1000
-```
-
 The script will:
 1. Display a cool ASCII art banner
-2. Search for WordPress sites using Shodan (respecting the specified result limit)
-3. Attempt to resolve domain names for IP addresses
-4. Check each site for exposed wp-cron.php endpoints
-5. Cross-reference findings with HackerOne programs (if credentials are provided)
-6. Save results to `results.csv`
+2. Set up logging with timestamped filenames
+3. Validate all required environment variables
+4. Search for WordPress sites using Shodan (respecting the specified result limit)
+5. Attempt to resolve domain names for IP addresses
+6. Check each site for exposed wp-cron.php endpoints (only 200 OK responses)
+7. Cross-reference findings with HackerOne programs
+8. Save results to a timestamped CSV file
 
-## Output
+## Output Files
 
-The script generates a CSV file (`results.csv`) with the following columns:
-- URL: The URL of the WordPress site
-- Domain: The resolved domain name (if available)
-- Vulnerable: Whether wp-cron.php is exposed
-- Checked At: Timestamp of when the check was performed
-- HackerOne Program: The URL of the corresponding HackerOne program
+The script generates two types of output files:
+
+1. Results CSV (`wpdecronifier_results_YYYYMMDD_HHMMSS_UTC.csv`):
+   - vulnerable_url: The URL of the vulnerable WordPress site
+   - hackerone_program: The URL of the corresponding HackerOne program
+   - checked_at: Timestamp of when the check was performed
+
+2. Execution Log (`wpdecronifier_execution_log_YYYYMMDD_HHMMSS_UTC.log`):
+   - Complete execution log including all console output
+   - Search progress and results
+   - Error messages and warnings
+   - Final summary
 
 ## Security Considerations
 
@@ -107,17 +112,18 @@ The script generates a CSV file (`results.csv`) with the following columns:
 - Relies on Shodan's database, which may not be completely up-to-date
 - HackerOne API rate limits may apply
 - Some sites may implement security measures that prevent scanning
-- False positives may occur
-- HackerOne program matching requires valid API credentials
+- Only considers direct 200 OK responses as vulnerable (no redirect following)
+- All environment variables (SHODAN_API_KEY, H1_TOKEN, H1_USERNAME) are required
+- Shodan API query credits may limit the number of results
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Feel free to submit issues, fork the repository, and create pull requests for any improvements.
 
-## Licensing
+## License
 
-The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
+This project is licensed under the MIT License - see the LICENSE file for details.
 
-## Legal disclaimer
+## Disclaimer
 
-Usage of this tool to interact with targets without prior mutual consent is illegal. It's the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program. Only use for educational purposes.
+This tool is for educational and research purposes only. Users are responsible for ensuring they have permission to scan target systems and comply with all applicable laws and regulations. 
