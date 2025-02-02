@@ -116,14 +116,10 @@ The script generates two types of output files:
 - All environment variables (SHODAN_API_KEY, H1_TOKEN, H1_USERNAME) are required
 - Shodan API query credits may limit the number of results
 
-## Contributing
+# Licensing
 
-Feel free to submit issues, fork the repository, and create pull requests for any improvements.
+The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
 
-## License
+# Legal disclaimer
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Disclaimer
-
-This tool is for educational and research purposes only. Users are responsible for ensuring they have permission to scan target systems and comply with all applicable laws and regulations. 
+Usage of this tool to interact with targets without prior mutual consent is illegal. It's the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program. Only use for educational purposes.regulations. 
