@@ -26,6 +26,10 @@ from typing import List, Tuple, Optional, Union
 from datetime import datetime, UTC
 import socket
 from dns import resolver, reversename
+import gzip
+import json
+from io import BytesIO
+from urllib.parse import urljoin
 
 # Disable SSL warnings since we're dealing with potentially self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -42,8 +46,8 @@ class StreamToLogger:
     def write(self, buf):
         for line in buf.rstrip().splitlines():
             self.logger.log(self.log_level, line.rstrip())
-            # Also print to console
-            print(line.rstrip(), file=sys.__stdout__)
+            # Also print to console using print function
+            print(line.rstrip())
 
     def flush(self):
         pass
@@ -58,30 +62,313 @@ def setup_logging(start_time: datetime) -> str:
     Returns:
         str: Name of the log file created
     """
-    # Create log filename with UTC timestamp
-    log_filename = f"wpdecronifier_execution_log_{start_time.strftime('%Y%m%d_%H%M%S_UTC')}.log"
+    # Use a fixed log filename
+    log_filename = "wpdecronifier.log"
     
     # Configure logging
-    formatter = logging.Formatter('%(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
-    # File handler
-    file_handler = logging.FileHandler(log_filename)
+    # File handler with append mode
+    file_handler = logging.FileHandler(log_filename, mode='a')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
     
     # Configure root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
     
-    # No need to redirect stdout/stderr since we're using direct console handler
+    # Remove any existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add our handler
+    root_logger.addHandler(file_handler)
+    
+    # Add a separator line for new execution
+    root_logger.info("\n" + "="*80)
+    root_logger.info(f"Starting new scan at {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    root_logger.info("="*80 + "\n")
+    
+    # Store original print function
+    original_print = print
+    
+    def safe_print(*args, **kwargs):
+        # Convert all arguments to strings and join them
+        message = " ".join(str(arg) for arg in args)
+        # Log the message
+        root_logger.info(message)
+        # Call original print without the 'file' argument to ensure it goes to stdout
+        kwargs.pop('file', None)
+        original_print(*args, **kwargs)
+    
+    # Replace the built-in print function with our safe version
+    import builtins
+    builtins.print = safe_print
+    
     return log_filename
+
+class WordPressSitesFinder:
+    """
+    A class to find WordPress sites using various free methods.
+    """
+    
+    def __init__(self, result_limit=None):
+        self.result_limit = result_limit
+        self.unique_sites = set()  # Use set for O(1) duplicate checking
+        self.total_processed = 0
+        self.start_time = time.time()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'WPDecronifier/1.0 (Research Tool)'
+        })
+        self.limit_reached = False  # Flag to signal all workers to stop
+        
+        # Create cache directory if it doesn't exist
+        self.cache_dir = os.path.join(os.getcwd(), 'commoncrawl_cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+    def _extract_domain(self, url):
+        """Extract domain from URL."""
+        try:
+            parsed = urlparse(url)
+            return parsed.netloc.lower()
+        except:
+            return None
+
+    def _should_skip_domain(self, domain):
+        """Check if a domain should be skipped."""
+        skip_domains = {
+            'wordpress.com', 'wp.com', 'cloudfront.net', 'amazonaws.com',
+            'wpengine.com', 'pantheonsite.io', 'googleusercontent.com',
+            'wpvip.com', 'kinsta.com', 'hostgator.com', 'bluehost.com',
+            'cdn.', 'cache.', 'static.', 'assets.', 'media.',
+            'wp-content.', 'wp-includes.', 'wp-plugins.',
+            's3.', 'storage.', 'img.', 'images.'
+        }
+        return any(skip in domain.lower() for skip in skip_domains)
+
+    def _validate_wordpress_site(self, url):
+        """Validate if a site is actually running WordPress."""
+        try:
+            # Try to fetch the site with a short timeout
+            response = self.session.get(url, timeout=5, verify=False, allow_redirects=True)
+            if response.status_code != 200:
+                return False
+
+            # Check response headers and content for WordPress indicators
+            headers = response.headers
+            content = response.text.lower()
+
+            # Check for common WordPress headers
+            if any(h for h in headers.values() if 'wordpress' in h.lower()):
+                return True
+
+            # Check for common WordPress meta tags
+            if 'wp-content' in content or 'wp-includes' in content:
+                return True
+
+            # Check for WordPress generator meta tag
+            if 'meta name="generator" content="wordpress' in content:
+                return True
+
+            # Try to fetch wp-json API
+            try:
+                api_response = self.session.get(f"{url}/wp-json", timeout=5, verify=False)
+                if api_response.status_code == 200 and 'application/json' in api_response.headers.get('content-type', ''):
+                    return True
+            except:
+                pass
+
+            return False
+        except:
+            return False
+
+    def _get_cached_file(self, url, file_path):
+        """
+        Get file from cache or download if not present.
+        Returns the path to the cached file.
+        """
+        # Create a safe filename from the URL
+        cache_filename = os.path.join(self.cache_dir, os.path.basename(file_path))
+        
+        # If file exists in cache and is not empty, use it
+        if os.path.exists(cache_filename) and os.path.getsize(cache_filename) > 0:
+            print(f"[+] Using cached file: {cache_filename}")
+            return cache_filename
+            
+        # File not in cache, download it
+        print(f"[+] Downloading file: {url}")
+        try:
+            response = self.session.get(url, stream=True)
+            response.raise_for_status()
+            
+            with open(cache_filename, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            print(f"[+] File cached at: {cache_filename}")
+            return cache_filename
+            
+        except Exception as e:
+            print(f"[-] Error downloading file: {str(e)}")
+            if os.path.exists(cache_filename):
+                os.remove(cache_filename)  # Remove partial download
+            return None
+
+    def _process_wet_file(self, file_info):
+        """Process a single WET file and return found WordPress sites."""
+        if self.limit_reached:  # Check if limit was reached by another worker
+            return []
+            
+        file_num, file_path, base_url = file_info
+        new_sites = set()
+        
+        try:
+            # Get file from cache or download
+            wet_url = f"{base_url}/{file_path}"
+            cached_file = self._get_cached_file(wet_url, file_path)
+            
+            if not cached_file:
+                return []
+
+            # WordPress-specific patterns
+            patterns = [
+                b'wp-admin',
+                b'wp-includes',
+                b'wp-content',
+                b'xmlrpc.php',
+                b'wp-cron.php',
+                b'wp-json'
+            ]
+
+            with gzip.open(cached_file, 'rb') as wet_gz:
+                # Skip the WARC header
+                for line in wet_gz:
+                    if line.strip() == b'':
+                        break
+
+                # Process the content
+                current_url = None
+                for line in wet_gz:
+                    if self.limit_reached:  # Check if limit was reached by another worker
+                        return list(new_sites)
+                        
+                    try:
+                        line = line.strip()
+                        if line.startswith(b'WARC-Target-URI:'):
+                            current_url = line.split(b':', 1)[1].strip().decode('utf-8')
+                        elif any(pattern in line.lower() for pattern in patterns):
+                            if current_url:
+                                domain = self._extract_domain(current_url)
+                                if domain and not self._should_skip_domain(domain):
+                                    site_url = f"https://{domain}"
+                                    # Use a lock to ensure atomic operations
+                                    if site_url not in self.unique_sites:
+                                        if self._validate_wordpress_site(site_url):
+                                            # Double-check after validation to ensure we haven't exceeded limit
+                                            if site_url not in self.unique_sites and not self.limit_reached:
+                                                new_sites.add(site_url)
+                                                self.unique_sites.add(site_url)  # Add to global set
+                                                site_count = len(self.unique_sites)
+                                                limit_info = f"[{site_count}/{self.result_limit}]" if self.result_limit else f"[{site_count}]"
+                                                print(f"[+] Found and validated WordPress site {limit_info}: {site_url}")
+                                                
+                                                # If we've reached the limit, signal all workers to stop
+                                                if self.result_limit and site_count >= self.result_limit:
+                                                    self.limit_reached = True
+                                                    print(f"\n[+] Reached target of {self.result_limit} sites")
+                                                    return list(new_sites)
+
+                    except Exception as e:
+                        continue
+
+            return list(new_sites)
+
+        except Exception as e:
+            print(f"[-] Error processing file {file_path}: {str(e)}")
+            return []
+
+    def search_commoncrawl(self):
+        """Search for WordPress sites using Common Crawl raw data files."""
+        # Use a known stable index from late 2023
+        base_url = 'https://data.commoncrawl.org'
+        index = 'CC-MAIN-2023-23'
+        print(f"[+] Using Common Crawl index: {index}")
+
+        # First, get the index file list
+        try:
+            print("[+] Fetching index file list...")
+            index_list_url = f"{base_url}/crawl-data/{index}/wet.paths.gz"
+            
+            # Get index file from cache or download
+            index_file = self._get_cached_file(index_list_url, "wet.paths.gz")
+            if not index_file:
+                print("[-] Failed to fetch index file list")
+                return []
+
+            # Process the gzipped index list
+            found_sites = []
+            with gzip.open(index_file, 'rb') as gz:
+                # Get total number of files
+                files = [line.decode('utf-8').strip() for line in gz.readlines()]
+                total_files = len(files)
+                print(f"[+] Found {total_files} index files")
+
+                # Process a subset of files if we have a result limit
+                if self.result_limit:
+                    files = files[:min(10, total_files)]  # Process max 10 files when limit is set
+                else:
+                    files = files[:min(50, total_files)]  # Process max 50 files when no limit
+
+                # Prepare file processing tasks
+                tasks = [(i, file_path, base_url) for i, file_path in enumerate(files, 1)]
+                
+                # Process files in parallel
+                max_workers = min(10, len(tasks))  # Use up to 10 workers
+                print(f"[+] Starting parallel processing with {max_workers} workers...")
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = []
+                    for task in tasks:
+                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
+                            break
+                        futures.append(executor.submit(self._process_wet_file, task))
+                        
+                    # Process results as they complete
+                    for future in futures:
+                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
+                            break
+                            
+                        sites = future.result()
+                        self.total_processed += 1
+                        
+                        if sites:
+                            found_sites.extend(sites)
+                        
+                        # Show progress
+                        elapsed_time = time.time() - self.start_time
+                        files_per_second = self.total_processed / elapsed_time if elapsed_time > 0 else 0
+                        print(f"\r[+] Processed {self.total_processed}/{len(tasks)} files | "
+                              f"Found {len(self.unique_sites)} unique sites | "
+                              f"Speed: {files_per_second:.1f} files/sec", end='', flush=True)
+
+                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
+                            print(f"\n[+] Found {len(self.unique_sites)} WordPress sites")
+                            break
+
+                print("\n[+] WordPress site discovery completed")
+
+        except Exception as e:
+            print(f"\n[-] Error: {str(e)}")
+            return []
+
+        # Return list of tuples (url, domain) as expected by WordPressCronScanner
+        # Ensure we don't exceed the limit
+        sites_list = list(self.unique_sites)
+        if self.result_limit:
+            sites_list = sites_list[:self.result_limit]
+        return [(url, self._extract_domain(url)) for url in sites_list]
 
 class WordPressCronScanner:
     """
@@ -89,28 +376,32 @@ class WordPressCronScanner:
     and cross-references them with HackerOne bug bounty programs.
     """
 
-    def __init__(self, shodan_api_key: str, result_limit: Optional[int] = None):
+    def __init__(self, result_limit: Optional[int] = None):
         """
-        Initialize the scanner with necessary API keys and configurations.
+        Initialize the scanner with configurations.
         
         Args:
-            shodan_api_key (str): API key for Shodan.io
             result_limit (Optional[int]): Maximum number of results to process (None for unlimited)
         """
-        self.shodan_api = shodan.Shodan(shodan_api_key)
         self.result_limit = result_limit
         self.session = requests.Session()
-        # Disable SSL verification for handling self-signed certificates
         self.session.verify = False
-        # Set timeout to prevent hanging on slow responses
         self.session.timeout = 10
-        # Add user-agent to be more transparent about the scanning
         self.session.headers.update({
             'User-Agent': 'WordPress-Cron-Scanner/1.0 (Security Research)'
         })
-        # Counter for progress tracking
         self.current_progress = 0
         self.total_items = 0
+
+    def get_wordpress_sites(self) -> List[Tuple[str, Optional[str]]]:
+        """
+        Get WordPress sites using Common Crawl.
+        
+        Returns:
+            List[Tuple[str, Optional[str]]]: List of tuples containing (site_url, domain)
+        """
+        finder = WordPressSitesFinder(self.result_limit)
+        return finder.search_commoncrawl()
 
     def update_progress(self, message: str, increment: bool = True) -> None:
         """
@@ -187,106 +478,6 @@ class WordPressCronScanner:
         site_url = f"{protocol}://{domain if domain else host}"
         return (site_url, domain)
 
-    def get_wordpress_sites(self) -> List[Tuple[str, Optional[str]]]:
-        """
-        Search for WordPress sites using Shodan API with proper pagination.
-        
-        Returns:
-            List[Tuple[str, Optional[str]]]: List of tuples containing (site_url, domain)
-        """
-        wordpress_sites = set()  # Using a set to avoid duplicates
-        processed_ips = set()    # Track processed IPs to avoid duplicate resolutions
-        
-        try:
-            print("\n[+] Initiating Shodan search for WordPress sites...")
-            if self.result_limit:
-                print(f"[+] Result limit set to: {self.result_limit}")
-            
-            # Use a single, targeted query instead of multiple queries
-            query = 'http.component:wordpress'
-            print(f"[+] Searching Shodan with query: {query}")
-            
-            try:
-                page = 1
-                total_results = 0
-                
-                while True:
-                    # Break if we've reached the limit
-                    if self.result_limit and len(wordpress_sites) >= self.result_limit:
-                        print(f"\n[+] Reached limit of {self.result_limit} sites, stopping search")
-                        break
-                        
-                    # Calculate remaining sites needed
-                    remaining = self.result_limit - len(wordpress_sites) if self.result_limit else 100
-                    if remaining <= 0:
-                        break
-                        
-                    try:
-                        results = self.shodan_api.search(query, page=page)
-                        matches = results.get('matches', [])
-                        
-                        if not matches:
-                            print(f"[+] No more results available")
-                            break
-                            
-                        print(f"[+] Processing page {page} with {len(matches)} results")
-                        total_results += len(matches)
-                        
-                        for result in matches:
-                            if self.result_limit and len(wordpress_sites) >= self.result_limit:
-                                break
-                                
-                            ip = result.get('ip_str')
-                            if ip not in processed_ips:
-                                processed_ips.add(ip)
-                                site_info = self.get_site_url(result)
-                                
-                                if site_info:
-                                    url, domain = site_info
-                                    site_key = (url.lower(), domain.lower() if domain else None)
-                                    
-                                    if site_key not in wordpress_sites:
-                                        wordpress_sites.add(site_key)
-                                        status = f"domain {domain}" if domain else "IP only"
-                                        print(f"[+] Found WordPress site: {url} ({status})")
-                        
-                        # Break if we've processed all available results
-                        if total_results >= results['total']:
-                            print(f"[+] Processed all {total_results} results")
-                            break
-                            
-                        page += 1
-                        time.sleep(1)  # Rate limiting
-                        
-                    except shodan.APIError as e:
-                        error_msg = str(e).lower()
-                        if "no information available" in error_msg:
-                            print(f"[+] No more results available")
-                            break
-                        elif "insufficient query credits" in error_msg or "daily search usage limit reached" in error_msg:
-                            print("\n[-] Shodan API limit reached. Please:")
-                            print("    1. Wait for your credits to reset, or")
-                            print("    2. Upgrade your Shodan API plan")
-                            break
-                        else:
-                            print(f"[-] Error on page {page}: {e}")
-                            time.sleep(5)
-                            continue
-                            
-            except shodan.APIError as e:
-                print(f"[-] Error with Shodan search: {e}")
-                if "insufficient query credits" in str(e).lower():
-                    print("\n[-] Shodan API limit reached. Please:")
-                    print("    1. Wait for your credits to reset, or")
-                    print("    2. Upgrade your Shodan API plan")
-            
-            print(f"\n[+] Found {len(wordpress_sites)} unique WordPress sites")
-            
-        except Exception as e:
-            print(f"[-] Unexpected error during search: {e}")
-            
-        return [(url, domain) for url, domain in wordpress_sites]
-
     def check_wp_cron(self, url):
         """
         Check if wp-cron.php endpoint is exposed.
@@ -346,6 +537,8 @@ class WordPressCronScanner:
                 print("[-] HackerOne credentials not found. Set H1_USERNAME and H1_TOKEN environment variables")
                 return programs
             
+            print(f"[+] Using HackerOne credentials for user: {h1_username}")
+            
             # Set up basic auth
             auth = (h1_username, h1_token)
             headers = {'Accept': 'application/json'}
@@ -353,16 +546,22 @@ class WordPressCronScanner:
             page = 1
             while True:
                 params = {'page[number]': page, 'page[size]': 100}
-                response = self.session.get(base_url, auth=auth, headers=headers, params=params)
+                print(f"[+] Fetching page {page} of HackerOne programs...")
                 
-                if response.status_code == 200:
+                response = self.session.get(base_url, auth=auth, headers=headers, params=params)
+                response_code = response.status_code
+                
+                print(f"[+] HackerOne API response code: {response_code}")
+                
+                if response_code == 200:
                     data = response.json()
                     batch = data.get('data', [])
                     if not batch:
                         break
                         
                     programs.extend(batch)
-                    print(f"[+] Retrieved page {page} with {len(batch)} programs")
+                    print(f"[+] Retrieved {len(batch)} programs from page {page}")
+                    print(f"[+] Total programs so far: {len(programs)}")
                     
                     # Check if there's a next page
                     if not data.get('links', {}).get('next'):
@@ -371,10 +570,11 @@ class WordPressCronScanner:
                     page += 1
                     time.sleep(1)  # Rate limiting
                 else:
-                    print(f"[-] Failed to fetch HackerOne programs: HTTP {response.status_code}")
+                    print(f"[-] Failed to fetch HackerOne programs: HTTP {response_code}")
+                    print(f"[-] Response: {response.text}")
                     break
                     
-            print(f"[+] Successfully retrieved {len(programs)} HackerOne programs")
+            print(f"\n[+] Successfully retrieved {len(programs)} HackerOne programs")
             
         except requests.RequestException as e:
             print(f"[-] Error fetching HackerOne programs: {e}")
@@ -393,9 +593,26 @@ class WordPressCronScanner:
             List[Tuple[str, str]]: List of matches (site_url, program_url)
         """
         matches = []
-        domain = urlparse(site_url).netloc
+        domain = urlparse(site_url).netloc.lower()
+        # Remove www. prefix if present for better matching
+        domain = domain.replace('www.', '')
         
         print(f"\n[*] Checking scope for domain: {domain}")
+        print(f"[*] Also checking variations of the domain")
+        
+        # Generate domain variations
+        domain_parts = domain.split('.')
+        domain_variations = {domain}  # Original domain
+        
+        # Add variations with and without www
+        if len(domain_parts) > 1:
+            domain_variations.add(f"www.{domain}")
+            # Add subdomain variations
+            if len(domain_parts) > 2:
+                domain_variations.add('.'.join(domain_parts[1:]))  # Without first subdomain
+                domain_variations.add(f"www.{'.'.join(domain_parts[1:])}")  # With www, without first subdomain
+        
+        print(f"[*] Domain variations being checked: {', '.join(domain_variations)}")
         
         for program in programs:
             try:
@@ -425,51 +642,75 @@ class WordPressCronScanner:
 
                     # Clean up the asset identifier
                     asset_identifier = asset_identifier.replace('*.', '')
+                    asset_identifier = asset_identifier.replace('www.', '')
                     
-                    # Check if domain matches scope
-                    if domain.endswith(asset_identifier) or asset_identifier.endswith(domain):
-                        program_url = f"https://hackerone.com/{handle}"
-                        matches.append((site_url, program_url))
-                        print(f"[+] Found matching program: {program_url}")
-                        print(f"    Asset identifier: {scope.get('asset_identifier')}")
+                    # Check all domain variations against the scope
+                    for domain_var in domain_variations:
+                        if (domain_var.endswith(asset_identifier) or 
+                            asset_identifier.endswith(domain_var) or
+                            domain_var == asset_identifier):
+                            program_url = f"https://hackerone.com/{handle}"
+                            match_tuple = (site_url, program_url)
+                            if match_tuple not in matches:  # Avoid duplicates
+                                matches.append(match_tuple)
+                                print(f"[+] Found matching program: {program_url}")
+                                print(f"    Asset identifier: {scope.get('asset_identifier')}")
+                                print(f"    Program name: {attributes.get('name')}")
+                                print(f"    Submission state: {scope.get('submission_state')}")
+                                print(f"    Matched on domain variation: {domain_var}")
                         
             except Exception as e:
                 print(f"[-] Error checking program {handle}: {str(e)}")
                 continue
                 
         if not matches:
-            print(f"[-] No matching HackerOne programs found for {domain}")
+            print(f"[-] No matching HackerOne programs found for {domain} or its variations")
             
         return matches
 
     def scan_and_save(self):
         start_time = datetime.now(UTC)
         print(f"\n[+] Starting scan at {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        print("\n[+] Initiating Shodan search for WordPress sites...")
         
+        # First, find WordPress sites
+        print("\n[+] Phase 1: Finding WordPress sites...")
         wordpress_sites = self.get_wordpress_sites()
+        if self.result_limit:
+            wordpress_sites = wordpress_sites[:self.result_limit]  # Ensure limit is enforced
         total_sites = len(wordpress_sites)
-        print(f"\n[+] Found {total_sites} WordPress sites to check")
+        print(f"[+] Found {total_sites} WordPress sites to check")
         
-        # Fetch HackerOne programs first
+        if not wordpress_sites:
+            print("[-] No WordPress sites found, exiting")
+            return
+        
+        # Next, fetch HackerOne programs
+        print("\n[+] Phase 2: Fetching HackerOne programs...")
         hackerone_programs = self.get_hackerone_programs()
         
+        if not hackerone_programs:
+            print("[-] No HackerOne programs found or error fetching programs")
+            return
+            
+        # Now check each WordPress site
         results = []
         vulnerable_count = 0
         h1_matches_count = 0
         
-        print("\n[+] Starting vulnerability checks...")
+        print(f"\n[+] Phase 3: Checking {total_sites} WordPress sites for wp-cron.php exposure...")
         for i, (site_url, domain) in enumerate(wordpress_sites, 1):
             print(f"\n[*] [{i}/{total_sites}] Checking {site_url}")
+            
+            # First check if the site is vulnerable
             is_vulnerable = self.check_wp_cron(site_url)
             
             if is_vulnerable:
                 vulnerable_count += 1
                 print(f"[!] Vulnerable: {site_url}")
-                # Check if the vulnerable site is in scope of any HackerOne program
+                
+                # Then check if it's in scope for any HackerOne program
                 scope_matches = self.check_scope(site_url, hackerone_programs)
                 
-                # Only save results if there are HackerOne matches
                 if scope_matches:
                     h1_matches_count += len(scope_matches)
                     print(f"[!] Found {len(scope_matches)} HackerOne program matches:")
@@ -482,10 +723,11 @@ class WordPressCronScanner:
                         })
                 else:
                     print("[-] No HackerOne program matches found")
+            else:
+                print("[-] Not vulnerable to wp-cron.php exposure")
 
-        # Save results to CSV only if we have HackerOne matches
+        # Save results to CSV if we found any matches
         if results:
-            # Generate filename with UTC timestamp
             filename = f"wpdecronifier_results_{start_time.strftime('%Y%m%d_%H%M%S_UTC')}.csv"
             with open(filename, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=['vulnerable_url', 'hackerone_program', 'checked_at'])
@@ -493,9 +735,9 @@ class WordPressCronScanner:
                 writer.writerows(results)
                 print(f"\n[+] Results saved to {filename}")
                 
-        # Print summary
+        # Print final summary
         print("\n[+] Scan Summary:")
-        print(f"    • Total sites checked: {total_sites}")
+        print(f"    • Total WordPress sites checked: {total_sites}")
         print(f"    • Vulnerable sites found: {vulnerable_count}")
         print(f"    • Sites with HackerOne matches: {h1_matches_count}")
         
@@ -503,9 +745,10 @@ class WordPressCronScanner:
             print("\n[!] HackerOne Program Matches:")
             seen_matches = set()
             for result in results:
-                if result['hackerone_program'] and result['hackerone_program'] not in seen_matches:
-                    seen_matches.add(result['hackerone_program'])
-                    print(f"    • {result['vulnerable_url']} → {result['hackerone_program']}")
+                match_key = f"{result['vulnerable_url']} → {result['hackerone_program']}"
+                if match_key not in seen_matches:
+                    seen_matches.add(match_key)
+                    print(f"    • {match_key}")
         elif vulnerable_count > 0:
             print("\n[-] Found vulnerable sites but none matched HackerOne programs")
         else:
@@ -522,10 +765,9 @@ def main():
     # Set up logging
     log_filename = setup_logging(start_time)
     
-    # Check for all required environment variables
+    # Check for HackerOne environment variables
     missing_vars = []
     env_vars = {
-        'SHODAN_API_KEY': 'Shodan API Key',
         'H1_TOKEN': 'HackerOne API Token',
         'H1_USERNAME': 'HackerOne Username'
     }
@@ -554,13 +796,15 @@ def main():
 
     # Initialize and run scanner
     try:
-        scanner = WordPressCronScanner(os.getenv('SHODAN_API_KEY'), result_limit)
+        scanner = WordPressCronScanner(result_limit)
         scanner.scan_and_save()
-        print(f"\n[+] Execution log saved to: {log_filename}")
+        print(f"\n[+] Execution log appended to: {log_filename}")
     except KeyboardInterrupt:
         print("\n[-] Scan interrupted by user")
     except Exception as e:
         print(f"\n[-] An unexpected error occurred: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main() 

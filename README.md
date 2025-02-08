@@ -4,11 +4,15 @@ This utility scans for WordPress sites exposed to the internet and checks if the
 
 ## Features
 
-- Searches for WordPress sites using Shodan API (with pagination)
+- Discovers WordPress sites using Common Crawl data (no Shodan API required)
+- Intelligent WordPress site validation with multiple indicators
+- Smart domain matching with multiple variations for HackerOne scope comparison
+- Parallel processing of Common Crawl files for faster discovery
+- Local file caching to improve performance across runs
 - Checks for exposed wp-cron.php endpoints (only considers 200 OK responses as vulnerable)
 - Cross-references findings with HackerOne public programs (with pagination)
 - Outputs results in CSV format with timestamped filenames
-- Comprehensive logging with both console output and log files
+- Unified logging with append mode for tracking all scans in a single file
 - Reverse DNS lookups for IP addresses
 - Cool ASCII art banner
 - Environment variable validation
@@ -17,7 +21,6 @@ This utility scans for WordPress sites exposed to the internet and checks if the
 ## Prerequisites
 
 - Python 3.6 or higher
-- Shodan API key (sign up at https://shodan.io)
 - HackerOne account and API token (required for program matching)
 
 ## Installation
@@ -42,9 +45,6 @@ pip install -r requirements.txt
 4. Set up your API credentials as environment variables:
 
 ```bash
-# Shodan API Key (required)
-export SHODAN_API_KEY='your-api-key-here'
-
 # HackerOne credentials (required)
 export H1_TOKEN='your-api-token-here'
 export H1_USERNAME='your-username-here'
@@ -76,13 +76,14 @@ Run the script:
 
 The script will:
 1. Display a cool ASCII art banner
-2. Set up logging with timestamped filenames
+2. Set up logging (appending to wpdecronifier.log)
 3. Validate all required environment variables
-4. Search for WordPress sites using Shodan (respecting the specified result limit)
-5. Attempt to resolve domain names for IP addresses
-6. Check each site for exposed wp-cron.php endpoints (only 200 OK responses)
-7. Cross-reference findings with HackerOne programs
-8. Save results to a timestamped CSV file
+4. Search for WordPress sites using Common Crawl data (respecting the specified result limit)
+5. Cache downloaded Common Crawl files for future use
+6. Validate discovered sites using multiple WordPress indicators
+7. Check each site for exposed wp-cron.php endpoints (only 200 OK responses)
+8. Cross-reference findings with HackerOne programs using smart domain matching
+9. Save results to a timestamped CSV file
 
 ## Output Files
 
@@ -93,11 +94,30 @@ The script generates two types of output files:
    - hackerone_program: The URL of the corresponding HackerOne program
    - checked_at: Timestamp of when the check was performed
 
-2. Execution Log (`wpdecronifier_execution_log_YYYYMMDD_HHMMSS_UTC.log`):
-   - Complete execution log including all console output
+2. Unified Log File (`wpdecronifier.log`):
+   - Complete execution log for all scans
+   - Clear separation between different scan sessions
    - Search progress and results
    - Error messages and warnings
-   - Final summary
+   - Final summaries
+
+## Smart Domain Matching
+
+The tool now includes intelligent domain matching when comparing WordPress sites against HackerOne program scopes:
+
+- Original domain (e.g., `example.com`)
+- With www prefix (e.g., `www.example.com`)
+- Subdomain variations (e.g., for `sub.example.com` it also checks `example.com`)
+- Case-insensitive matching
+- Normalized domain comparison (removing `www.` and `*.` prefixes)
+- Exact match and suffix matching support
+
+## Caching and Performance
+
+- Common Crawl files are cached locally in the `commoncrawl_cache` directory
+- Cached files are reused across runs to improve performance
+- Parallel processing of Common Crawl files with configurable worker count
+- Progress indicators showing processing speed and completion percentage
 
 ## Security Considerations
 
@@ -109,17 +129,20 @@ The script generates two types of output files:
 
 ## Limitations
 
-- Relies on Shodan's database, which may not be completely up-to-date
+- Common Crawl data may not be completely up-to-date
 - HackerOne API rate limits may apply
 - Some sites may implement security measures that prevent scanning
 - Only considers direct 200 OK responses as vulnerable (no redirect following)
-- All environment variables (SHODAN_API_KEY, H1_TOKEN, H1_USERNAME) are required
-- Shodan API query credits may limit the number of results
+- HackerOne credentials (H1_TOKEN, H1_USERNAME) are required
 
-# Licensing
+## Contributing
 
-The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
+Feel free to submit issues, fork the repository, and create pull requests for any improvements.
 
-# Legal disclaimer
+## License
 
-Usage of this tool to interact with targets without prior mutual consent is illegal. It's the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program. Only use for educational purposes.regulations. 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Disclaimer
+
+This tool is for educational and research purposes only. Users are responsible for ensuring they have permission to scan target systems and comply with all applicable laws and regulations. 
