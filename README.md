@@ -198,11 +198,11 @@ The tool operates in three phases:
 
 ## Contributing
 
-Feel free to submit issues, fork the repository, and create pull requests for any improvements.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-## License
+## Licensing
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
 
 ## Disclaimer
 
