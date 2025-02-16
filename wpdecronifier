@@ -9,10 +9,9 @@ print("""
 ██║███╗██║██╔═══╝ ██║  ██║██╔══╝  ██║     ██╔══██╗██║   ██║██║╚██╗██║██║██╔══╝  ██║██╔══╝  ██╔══██╗
 ╚███╔███╔╝██║     ██████╔╝███████╗╚██████╗██║  ██║╚██████╔╝██║ ╚████║██║██║     ██║███████╗██║  ██║
  ╚══╝╚══╝ ╚═╝     ╚═════╝ ╚══════╝ ╚═════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═╝
-                                                                                       v1.0
+                                                                                       v0.9.0
 """)
 
-import shodan
 import requests
 import csv
 import os
@@ -23,7 +22,7 @@ import logging
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Optional, Union
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 import socket
 from dns import resolver, reversename
 import gzip
@@ -54,7 +53,7 @@ class StreamToLogger:
 
 def setup_logging(start_time: datetime) -> str:
     """
-    Set up logging configuration to write to both file and console.
+    Set up logging configuration to write debug data to file and essential info to console.
     
     Args:
         start_time (datetime): Start time of the scan for consistent timestamps
@@ -68,42 +67,75 @@ def setup_logging(start_time: datetime) -> str:
     # Configure logging
     formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     
-    # File handler with append mode
+    # File handler with append mode - gets everything
     file_handler = logging.FileHandler(log_filename, mode='a')
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
+    
+    # Console handler - gets only important info
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
     
     # Configure root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)  # Allow all levels to be processed
     
     # Remove any existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
     
-    # Add our handler
+    # Add our handlers
     root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
     
     # Add a separator line for new execution
     root_logger.info("\n" + "="*80)
     root_logger.info(f"Starting new scan at {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     root_logger.info("="*80 + "\n")
     
+    def debug_print(*args, **kwargs):
+        """Print function that sends debug info to log file only."""
+        message = " ".join(str(arg) for arg in args)
+        root_logger.debug(message)
+    
+    def info_print(*args, **kwargs):
+        """Print function that sends info to both console and log file."""
+        message = " ".join(str(arg) for arg in args)
+        root_logger.info(message)
+    
     # Store original print function
     original_print = print
     
-    def safe_print(*args, **kwargs):
-        # Convert all arguments to strings and join them
+    def smart_print(*args, **kwargs):
+        """Smart print function that determines where to send output based on content."""
         message = " ".join(str(arg) for arg in args)
-        # Log the message
-        root_logger.info(message)
-        # Call original print without the 'file' argument to ensure it goes to stdout
-        kwargs.pop('file', None)
-        original_print(*args, **kwargs)
+        
+        # Debug messages go to file only
+        debug_indicators = [
+            '[+] Program data keys:',
+            '[+] Scope data keys:',
+            '[+] Domain object keys:',
+            '[+] Successfully parsed JSON response',
+            '[+] Response data:',
+            'API Response Status:',
+            'Program Details API Response Status:',
+            'Found domains in scope data',
+            'Added domain object:',
+            'Added domain:',
+            'Retrieved scope for program:',
+            'Attempting to save cache',
+            'Successfully saved cache'
+        ]
+        
+        if any(indicator in message for indicator in debug_indicators):
+            debug_print(message)
+        else:
+            info_print(message)
     
-    # Replace the built-in print function with our safe version
+    # Replace the built-in print function with our smart version
     import builtins
-    builtins.print = safe_print
+    builtins.print = smart_print
     
     return log_filename
 
@@ -122,11 +154,19 @@ class WordPressSitesFinder:
             'User-Agent': 'WPDecronifier/1.0 (Research Tool)'
         })
         self.limit_reached = False  # Flag to signal all workers to stop
+        self.interrupted = False  # Flag to track interruption
         
         # Create cache directory if it doesn't exist
         self.cache_dir = os.path.join(os.getcwd(), 'commoncrawl_cache')
         os.makedirs(self.cache_dir, exist_ok=True)
         
+    def cleanup(self):
+        """Perform cleanup operations."""
+        try:
+            self.session.close()
+        except:
+            pass
+
     def _extract_domain(self, url):
         """Extract domain from URL."""
         try:
@@ -150,6 +190,9 @@ class WordPressSitesFinder:
     def _validate_wordpress_site(self, url):
         """Validate if a site is actually running WordPress."""
         try:
+            if self.interrupted:  # Check for interruption
+                return False
+            
             # Try to fetch the site with a short timeout
             response = self.session.get(url, timeout=5, verify=False, allow_redirects=True)
             if response.status_code != 200:
@@ -173,12 +216,17 @@ class WordPressSitesFinder:
 
             # Try to fetch wp-json API
             try:
+                if self.interrupted:  # Check for interruption
+                    return False
                 api_response = self.session.get(f"{url}/wp-json", timeout=5, verify=False)
                 if api_response.status_code == 200 and 'application/json' in api_response.headers.get('content-type', ''):
                     return True
             except:
                 pass
 
+            return False
+        except KeyboardInterrupt:
+            self.interrupted = True
             return False
         except:
             return False
@@ -188,37 +236,45 @@ class WordPressSitesFinder:
         Get file from cache or download if not present.
         Returns the path to the cached file.
         """
-        # Create a safe filename from the URL
-        cache_filename = os.path.join(self.cache_dir, os.path.basename(file_path))
-        
-        # If file exists in cache and is not empty, use it
-        if os.path.exists(cache_filename) and os.path.getsize(cache_filename) > 0:
-            print(f"[+] Using cached file: {cache_filename}")
-            return cache_filename
-            
-        # File not in cache, download it
-        print(f"[+] Downloading file: {url}")
         try:
-            response = self.session.get(url, stream=True)
-            response.raise_for_status()
+            if self.interrupted:  # Check for interruption
+                return None
             
-            with open(cache_filename, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            # Create a safe filename from the URL
+            cache_filename = os.path.join(self.cache_dir, os.path.basename(file_path))
             
-            print(f"[+] File cached at: {cache_filename}")
-            return cache_filename
+            # If file exists in cache and is not empty, use it
+            if os.path.exists(cache_filename) and os.path.getsize(cache_filename) > 0:
+                print(f"[+] Using cached file: {cache_filename}")
+                return cache_filename
             
-        except Exception as e:
-            print(f"[-] Error downloading file: {str(e)}")
-            if os.path.exists(cache_filename):
-                os.remove(cache_filename)  # Remove partial download
+            # File not in cache, download it
+            print(f"[+] Downloading file: {url}")
+            try:
+                response = self.session.get(url, stream=True)
+                response.raise_for_status()
+                
+                with open(cache_filename, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                print(f"[+] File cached at: {cache_filename}")
+                return cache_filename
+                
+            except Exception as e:
+                print(f"[-] Error downloading file: {str(e)}")
+                if os.path.exists(cache_filename):
+                    os.remove(cache_filename)  # Remove partial download
+                return None
+            
+        except KeyboardInterrupt:
+            self.interrupted = True
             return None
 
     def _process_wet_file(self, file_info):
         """Process a single WET file and return found WordPress sites."""
-        if self.limit_reached:  # Check if limit was reached by another worker
+        if self.limit_reached or self.interrupted:  # Check if limit was reached or interrupted
             return []
             
         file_num, file_path, base_url = file_info
@@ -251,7 +307,7 @@ class WordPressSitesFinder:
                 # Process the content
                 current_url = None
                 for line in wet_gz:
-                    if self.limit_reached:  # Check if limit was reached by another worker
+                    if self.limit_reached or self.interrupted:  # Check if limit was reached or interrupted
                         return list(new_sites)
                         
                     try:
@@ -267,7 +323,7 @@ class WordPressSitesFinder:
                                     if site_url not in self.unique_sites:
                                         if self._validate_wordpress_site(site_url):
                                             # Double-check after validation to ensure we haven't exceeded limit
-                                            if site_url not in self.unique_sites and not self.limit_reached:
+                                            if site_url not in self.unique_sites and not self.limit_reached and not self.interrupted:
                                                 new_sites.add(site_url)
                                                 self.unique_sites.add(site_url)  # Add to global set
                                                 site_count = len(self.unique_sites)
@@ -277,7 +333,7 @@ class WordPressSitesFinder:
                                                 # If we've reached the limit, signal all workers to stop
                                                 if self.result_limit and site_count >= self.result_limit:
                                                     self.limit_reached = True
-                                                    print(f"\n[+] Reached target of {self.result_limit} sites")
+                                                    print(f"\n[+] Found {len(self.unique_sites)} WordPress sites")
                                                     return list(new_sites)
 
                     except Exception as e:
@@ -285,26 +341,45 @@ class WordPressSitesFinder:
 
             return list(new_sites)
 
+        except KeyboardInterrupt:
+            self.interrupted = True
+            return list(new_sites)
         except Exception as e:
             print(f"[-] Error processing file {file_path}: {str(e)}")
             return []
 
     def search_commoncrawl(self):
         """Search for WordPress sites using Common Crawl raw data files."""
-        # Use a known stable index from late 2023
-        base_url = 'https://data.commoncrawl.org'
-        index = 'CC-MAIN-2023-23'
-        print(f"[+] Using Common Crawl index: {index}")
-
-        # First, get the index file list
         try:
+            # Fetch the latest Common Crawl index
+            print("[+] Fetching latest Common Crawl index...")
+            collinfo_url = "https://index.commoncrawl.org/collinfo.json"
+            
+            try:
+                response = self.session.get(collinfo_url, timeout=10)
+                response.raise_for_status()
+                collections = response.json()
+                
+                # Get the latest collection
+                latest = collections[0]  # Collections are sorted by date, newest first
+                index = latest['id']
+                print(f"[+] Using latest Common Crawl index: {index}")
+                print(f"[+] Collection date: {latest['name']}")
+            except Exception as e:
+                print(f"[-] Error fetching latest index: {str(e)}")
+                print("[*] Falling back to known stable index")
+                index = 'CC-MAIN-2024-04'  # Fallback to a known stable recent index
+                print(f"[+] Using fallback Common Crawl index: {index}")
+
+            # First, get the index file list
+            base_url = 'https://data.commoncrawl.org'
             print("[+] Fetching index file list...")
             index_list_url = f"{base_url}/crawl-data/{index}/wet.paths.gz"
             
             # Get index file from cache or download
             index_file = self._get_cached_file(index_list_url, "wet.paths.gz")
-            if not index_file:
-                print("[-] Failed to fetch index file list")
+            if not index_file or self.interrupted:
+                print("[-] Failed to fetch index file list or interrupted")
                 return []
 
             # Process the gzipped index list
@@ -317,9 +392,13 @@ class WordPressSitesFinder:
 
                 # Process a subset of files if we have a result limit
                 if self.result_limit:
-                    files = files[:min(10, total_files)]  # Process max 10 files when limit is set
+                    # Process fewer files when we have a limit to avoid unnecessary work
+                    max_files = min(5, total_files)  # Reduced from 10 to 5 for limited searches
                 else:
-                    files = files[:min(50, total_files)]  # Process max 50 files when no limit
+                    max_files = min(50, total_files)  # Keep 50 for unlimited searches
+                
+                files = files[:max_files]
+                print(f"[+] Processing {len(files)} files to find WordPress sites...")
 
                 # Prepare file processing tasks
                 tasks = [(i, file_path, base_url) for i, file_path in enumerate(files, 1)]
@@ -328,46 +407,74 @@ class WordPressSitesFinder:
                 max_workers = min(10, len(tasks))  # Use up to 10 workers
                 print(f"[+] Starting parallel processing with {max_workers} workers...")
                 
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = []
-                    for task in tasks:
-                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
-                            break
-                        futures.append(executor.submit(self._process_wet_file, task))
-                        
-                    # Process results as they complete
-                    for future in futures:
-                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
-                            break
+                try:
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = []
+                        for task in tasks:
+                            if self.limit_reached or self.interrupted:
+                                break
+                            futures.append(executor.submit(self._process_wet_file, task))
                             
-                        sites = future.result()
-                        self.total_processed += 1
-                        
-                        if sites:
-                            found_sites.extend(sites)
-                        
-                        # Show progress
-                        elapsed_time = time.time() - self.start_time
-                        files_per_second = self.total_processed / elapsed_time if elapsed_time > 0 else 0
-                        print(f"\r[+] Processed {self.total_processed}/{len(tasks)} files | "
-                              f"Found {len(self.unique_sites)} unique sites | "
-                              f"Speed: {files_per_second:.1f} files/sec", end='', flush=True)
+                        # Process results as they complete
+                        for future in futures:
+                            if self.limit_reached or self.interrupted:
+                                break
+                                
+                            try:
+                                sites = future.result()
+                                self.total_processed += 1
+                                
+                                if sites:
+                                    found_sites.extend(sites)
+                                
+                                # Show progress
+                                elapsed_time = time.time() - self.start_time
+                                files_per_second = self.total_processed / elapsed_time if elapsed_time > 0 else 0
+                                print(f"\r[+] Processed {self.total_processed}/{len(tasks)} files | "
+                                      f"Found {len(self.unique_sites)} unique sites | "
+                                      f"Speed: {files_per_second:.1f} files/sec", end='', flush=True)
+                            except KeyboardInterrupt:
+                                self.interrupted = True
+                                executor.shutdown(wait=False)  # Force shutdown of executor
+                                break
+                            except Exception as e:
+                                print(f"\n[-] Error processing task: {str(e)}")
+                                continue
 
-                        if self.result_limit and len(self.unique_sites) >= self.result_limit:
-                            print(f"\n[+] Found {len(self.unique_sites)} WordPress sites")
-                            break
+                    if not self.interrupted:
+                        print("\n[+] WordPress site discovery completed")
 
-                print("\n[+] WordPress site discovery completed")
+                except KeyboardInterrupt:
+                    self.interrupted = True
+                    print("\n\n[!] Site discovery interrupted by user")
+                    if executor:
+                        executor.shutdown(wait=False)  # Force shutdown of executor
 
+        except KeyboardInterrupt:
+            self.interrupted = True
+            print("\n\n[!] Site discovery interrupted by user")
         except Exception as e:
             print(f"\n[-] Error: {str(e)}")
-            return []
-
+        finally:
+            self.cleanup()
+        
+        if self.interrupted:
+            print(f"\n[+] Found {len(self.unique_sites)} sites before interruption")
+        
         # Return list of tuples (url, domain) as expected by WordPressCronScanner
         # Ensure we don't exceed the limit
         sites_list = list(self.unique_sites)
         if self.result_limit:
             sites_list = sites_list[:self.result_limit]
+            if not self.interrupted:
+                print(f"[+] Returning {len(sites_list)} sites (limited by user request)")
+        else:
+            if not self.interrupted:
+                print(f"[+] Returning all {len(sites_list)} found sites")
+        
+        if not self.interrupted:
+            print("\n[+] Moving to Phase 2: Checking sites against bug bounty programs...")
+        
         return [(url, self._extract_domain(url)) for url in sites_list]
 
 class WordPressCronScanner:
@@ -392,6 +499,206 @@ class WordPressCronScanner:
         })
         self.current_progress = 0
         self.total_items = 0
+        self.interrupted = False  # Flag to track interruption
+        
+        # Create cache directory if it doesn't exist
+        self.cache_dir = os.path.join(os.getcwd(), 'api_cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # Cache file paths
+        self.h1_cache_file = os.path.join(self.cache_dir, 'hackerone_programs.json')
+        self.intigriti_cache_file = os.path.join(self.cache_dir, 'intigriti_programs.json')
+        
+        # Cache duration (24 hours by default)
+        self.cache_duration = timedelta(hours=24)
+        
+        # Results tracking
+        self.results = []
+        self.vulnerable_count = 0
+        self.h1_matches_count = 0
+        self.intigriti_matches_count = 0
+        self.other_bb_count = 0
+        self.total_sites = 0
+        self.current_site = 0
+
+    def cleanup(self):
+        """Perform cleanup operations."""
+        try:
+            self.session.close()
+        except:
+            pass
+
+    def save_progress(self, start_time: datetime):
+        """Save current progress to results file."""
+        try:
+            # Always show progress summary, even if no results yet
+            print("\n[+] Progress Summary (Interrupted):")
+            print(f"    • Sites processed: {self.current_site}/{self.total_sites}")
+            print(f"    • Vulnerable sites found: {self.vulnerable_count}")
+            print(f"    • HackerOne program matches: {self.h1_matches_count}")
+            print(f"    • Intigriti program matches: {self.intigriti_matches_count}")
+            print(f"    • Other bug bounty programs found: {self.other_bb_count}")
+            
+            # Save results if we have any
+            if self.results:
+                # Save to results.csv (append mode)
+                results_file = "results.csv"
+                file_exists = os.path.exists(results_file)
+                
+                with open(results_file, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['vulnerable_url', 'program_url', 'platform', 'checked_at'])
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerows(self.results)
+                print(f"\n[+] Progress saved to {results_file}")
+                
+                if self.h1_matches_count > 0 or self.intigriti_matches_count > 0 or self.other_bb_count > 0:
+                    print("\n[!] Bug Bounty Program Matches Found So Far:")
+                    seen_matches = set()
+                    for result in self.results:
+                        match_key = f"{result['vulnerable_url']} → {result['program_url']} ({result['platform']})"
+                        if match_key not in seen_matches:
+                            seen_matches.add(match_key)
+                            print(f"    • {match_key}")
+            else:
+                print("\n[-] No results to save yet")
+            
+        except Exception as e:
+            print(f"\n[-] Error saving progress: {str(e)}")
+
+    def scan_and_save(self):
+        start_time = datetime.now(UTC)
+        print(f"\n[+] Starting scan at {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        
+        try:
+            # First, find WordPress sites
+            print("\n[+] Phase 1: Finding WordPress sites...")
+            wordpress_sites = self.get_wordpress_sites()
+            if self.interrupted:
+                return
+                
+            if self.result_limit:
+                wordpress_sites = wordpress_sites[:self.result_limit]  # Ensure limit is enforced
+            self.total_sites = len(wordpress_sites)
+            print(f"[+] Found {self.total_sites} WordPress sites to check")
+            
+            if not wordpress_sites:
+                print("[-] No WordPress sites found, exiting")
+                return
+            
+            # Next, fetch bug bounty programs
+            print("\n[+] Phase 2: Fetching bug bounty programs...")
+            hackerone_programs = self.get_hackerone_programs()
+            if self.interrupted:
+                return
+                
+            intigriti_programs = self.get_intigriti_programs()
+            if self.interrupted:
+                return
+            
+            if not hackerone_programs and not intigriti_programs:
+                print("[-] No bug bounty programs found or error fetching programs")
+                return
+                
+            # Now check each WordPress site
+            print(f"\n[+] Phase 3: Checking {self.total_sites} WordPress sites for wp-cron.php exposure...")
+            for i, (site_url, domain) in enumerate(wordpress_sites, 1):
+                if self.interrupted:
+                    break
+                    
+                self.current_site = i
+                print(f"\n[*] [{i}/{self.total_sites}] Checking {site_url}")
+                
+                try:
+                    # First check if the site is vulnerable
+                    is_vulnerable = self.check_wp_cron(site_url)
+                    
+                    if is_vulnerable:
+                        self.vulnerable_count += 1
+                        print(f"[!] Vulnerable: {site_url}")
+                        
+                        # Then check if it's in scope for any bug bounty program
+                        scope_matches = self.check_scope(site_url, hackerone_programs, intigriti_programs)
+                        
+                        if scope_matches:
+                            for site_url, program_url, platform in scope_matches:
+                                if platform == "HackerOne":
+                                    self.h1_matches_count += 1
+                                else:
+                                    self.intigriti_matches_count += 1
+                                self.results.append({
+                                    'vulnerable_url': site_url,
+                                    'program_url': program_url,
+                                    'platform': platform,
+                                    'checked_at': datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                                })
+                        else:
+                            print("[*] No HackerOne or Intigriti matches found, searching web for other bug bounty programs...")
+                            if domain:
+                                web_bb = self.check_web_for_bug_bounty(domain)
+                                if web_bb:
+                                    program_url, platform = web_bb
+                                    self.other_bb_count += 1
+                                    self.results.append({
+                                        'vulnerable_url': site_url,
+                                        'program_url': program_url,
+                                        'platform': platform,
+                                        'checked_at': datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+                                    })
+                                    print(f"[+] Found alternative bug bounty program: {platform}")
+                                else:
+                                    print("[-] No bug bounty programs found on the web")
+                    else:
+                        print("[-] Not vulnerable to wp-cron.php exposure")
+                    
+                except KeyboardInterrupt:
+                    self.interrupted = True
+                    break
+                except Exception as e:
+                    print(f"[-] Error checking site {site_url}: {str(e)}")
+                    continue
+
+            # Save final results if not interrupted
+            if not self.interrupted and self.results:
+                # Save to results.csv (append mode)
+                results_file = "results.csv"
+                file_exists = os.path.exists(results_file)
+                
+                with open(results_file, 'a', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['vulnerable_url', 'program_url', 'platform', 'checked_at'])
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerows(self.results)
+                    print(f"\n[+] Results saved to {results_file}")
+                    
+            # Print final summary
+            if not self.interrupted:
+                print("\n[+] Scan Summary:")
+                print(f"    • Total WordPress sites checked: {self.total_sites}")
+                print(f"    • Vulnerable sites found: {self.vulnerable_count}")
+                print(f"    • HackerOne program matches: {self.h1_matches_count}")
+                print(f"    • Intigriti program matches: {self.intigriti_matches_count}")
+                print(f"    • Other bug bounty programs found: {self.other_bb_count}")
+                
+                if self.h1_matches_count > 0 or self.intigriti_matches_count > 0 or self.other_bb_count > 0:
+                    print("\n[!] Bug Bounty Program Matches:")
+                    seen_matches = set()
+                    for result in self.results:
+                        match_key = f"{result['vulnerable_url']} → {result['program_url']} ({result['platform']})"
+                        if match_key not in seen_matches:
+                            seen_matches.add(match_key)
+                            print(f"    • {match_key}")
+                elif self.vulnerable_count > 0:
+                    print("\n[-] Found vulnerable sites but none matched any bug bounty programs")
+                else:
+                    print("\n[-] No vulnerable sites found")
+                
+        except KeyboardInterrupt:
+            self.interrupted = True
+            print("\n\n[!] Scan interrupted by user. Saving progress...")
+            self.save_progress(start_time)
+        finally:
+            self.cleanup()
 
     def get_wordpress_sites(self) -> List[Tuple[str, Optional[str]]]:
         """
@@ -498,7 +805,7 @@ class WordPressCronScanner:
             
             # Only consider it vulnerable if status code is exactly 200
             if response.status_code == 200:
-                print(f"[!] VULNERABLE: wp-cron.php is exposed at {wp_cron_url}")
+                print(f"[!] Vulnerable: wp-cron.php is exposed at {wp_cron_url}")
                 return True
             else:
                 print(f"[-] Not vulnerable: wp-cron.php returned status {response.status_code}")
@@ -520,10 +827,18 @@ class WordPressCronScanner:
     def get_hackerone_programs(self) -> List[dict]:
         """
         Fetch public HackerOne programs using their API with proper pagination.
+        Uses caching to reduce API calls.
         
         Returns:
             List[dict]: List of HackerOne program data
         """
+        # Try to load from cache first
+        cached_data = self._load_from_cache(self.h1_cache_file)
+        if cached_data is not None:
+            print(f"[+] Using cached HackerOne programs (expires in {self.cache_duration.total_seconds()/3600:.1f} hours)")
+            return cached_data
+            
+        print("[+] Cache invalid or missing, fetching fresh HackerOne programs...")
         programs = []
         try:
             print("\n[+] Fetching HackerOne public programs...")
@@ -576,21 +891,78 @@ class WordPressCronScanner:
                     
             print(f"\n[+] Successfully retrieved {len(programs)} HackerOne programs")
             
+            # Save to cache
+            self._save_to_cache(programs, self.h1_cache_file)
+            
         except requests.RequestException as e:
             print(f"[-] Error fetching HackerOne programs: {e}")
             
         return programs
 
-    def check_scope(self, site_url: str, programs: List[dict]) -> List[Tuple[str, str]]:
+    def get_intigriti_programs(self) -> List[dict]:
         """
-        Check if a site is in scope of any HackerOne program.
+        Fetch public Intigriti programs using their API.
+        Uses caching to reduce API calls.
         
-        Args:
-            site_url (str): URL of the WordPress site
-            programs (List[dict]): List of HackerOne programs
-            
         Returns:
-            List[Tuple[str, str]]: List of matches (site_url, program_url)
+            List[dict]: List of Intigriti program data
+        """
+        # Try to load from cache first
+        cached_data = self._load_from_cache(self.intigriti_cache_file)
+        if cached_data is not None:
+            print(f"[+] Using cached Intigriti programs (expires in {self.cache_duration.total_seconds()/3600:.1f} hours)")
+            return cached_data
+            
+        print("[+] Cache invalid or missing, fetching fresh Intigriti programs...")
+        programs = []
+        try:
+            print("\n[+] Fetching Intigriti public programs...")
+            base_url = "https://api.intigriti.com/external/researcher/v1/programs"
+            
+            # Get Intigriti credentials from environment
+            intigriti_token = os.getenv('INTIGRITI_TOKEN')
+            
+            if not intigriti_token:
+                print("[-] Intigriti API token not found. Set INTIGRITI_TOKEN environment variable")
+                return programs
+            
+            print("[+] Using Intigriti API token")
+            
+            # Set up auth header
+            headers = {
+                'Accept': 'application/json',
+                'Authorization': f'Bearer {intigriti_token}'
+            }
+            
+            # Fetch all programs in one request
+            response = self.session.get(base_url, headers=headers)
+            response_code = response.status_code
+            
+            print(f"[+] Intigriti API response code: {response_code}")
+            
+            if response_code == 200:
+                data = response.json()
+                programs = data.get('records', [])
+                if programs:
+                    print(f"[+] Retrieved {len(programs)} programs")
+                    
+                    # Save to cache
+                    self._save_to_cache(programs, self.intigriti_cache_file)
+                    print(f"[+] Successfully cached {len(programs)} Intigriti programs")
+                else:
+                    print("[-] No programs found in response")
+            else:
+                print(f"[-] Failed to fetch Intigriti programs: HTTP {response_code}")
+                print(f"[-] Response: {response.text}")
+            
+        except requests.RequestException as e:
+            print(f"[-] Error fetching Intigriti programs: {e}")
+            
+        return programs
+
+    def check_scope(self, site_url: str, h1_programs: List[dict], intigriti_programs: List[dict]) -> List[Tuple[str, str, str]]:
+        """
+        Check if a site is in scope of any HackerOne or Intigriti program.
         """
         matches = []
         domain = urlparse(site_url).netloc.lower()
@@ -613,8 +985,10 @@ class WordPressCronScanner:
                 domain_variations.add(f"www.{'.'.join(domain_parts[1:])}")  # With www, without first subdomain
         
         print(f"[*] Domain variations being checked: {', '.join(domain_variations)}")
+        print("[*] Checking HackerOne programs...")
         
-        for program in programs:
+        # Check HackerOne programs
+        for program in h1_programs:
             try:
                 attributes = program.get('attributes', {})
                 handle = attributes.get('handle')
@@ -650,109 +1024,438 @@ class WordPressCronScanner:
                             asset_identifier.endswith(domain_var) or
                             domain_var == asset_identifier):
                             program_url = f"https://hackerone.com/{handle}"
-                            match_tuple = (site_url, program_url)
+                            match_tuple = (site_url, program_url, "HackerOne")
                             if match_tuple not in matches:  # Avoid duplicates
                                 matches.append(match_tuple)
-                                print(f"[+] Found matching program: {program_url}")
+                                print(f"[+] Found matching HackerOne program: {program_url}")
                                 print(f"    Asset identifier: {scope.get('asset_identifier')}")
                                 print(f"    Program name: {attributes.get('name')}")
                                 print(f"    Submission state: {scope.get('submission_state')}")
                                 print(f"    Matched on domain variation: {domain_var}")
                         
             except Exception as e:
-                print(f"[-] Error checking program {handle}: {str(e)}")
+                print(f"[-] Error checking HackerOne program: {str(e)}")
+                continue
+
+        print("[*] Checking Intigriti programs...")
+        # Check Intigriti programs
+        for program in intigriti_programs:
+            try:
+                program_id = program.get('id')
+                program_name = program.get('name')
+                program_handle = program.get('handle', '')
+                
+                if not program_id or not program_name:
+                    continue
+
+                # Get scope information
+                scope = program.get('scope', {})
+                domains = scope.get('content', [])
+                
+                if not domains:
+                    continue
+
+                # Check each domain in scope
+                for scope_domain in domains:
+                    if not isinstance(scope_domain, dict):
+                        continue
+                        
+                    # Get domain information
+                    domain_info = scope_domain.get('domain', '')
+                    if not domain_info:
+                        continue
+                        
+                    # Clean up the domain
+                    scope_domain_clean = domain_info.lower().replace('*.', '').replace('www.', '')
+                    
+                    # Check all domain variations against the scope
+                    for domain_var in domain_variations:
+                        if (domain_var.endswith(scope_domain_clean) or 
+                            scope_domain_clean.endswith(domain_var) or
+                            domain_var == scope_domain_clean):
+                            program_url = f"https://app.intigriti.com/programs/{program_handle}/detail"
+                            match_tuple = (site_url, program_url, "Intigriti")
+                            if match_tuple not in matches:  # Avoid duplicates
+                                matches.append(match_tuple)
+                                print(f"[+] Found matching Intigriti program: {program_url}")
+                                print(f"    Program name: {program_name}")
+                                print(f"    Matched domain: {domain_info}")
+                                print(f"    Matched on domain variation: {domain_var}")
+                                print(f"    Domain type: {scope_domain.get('type', 'unknown')}")
+                                print(f"    In scope: {scope_domain.get('inScope', True)}")
+                        
+            except Exception as e:
+                print(f"[-] Error checking Intigriti program: {str(e)}")
                 continue
                 
         if not matches:
-            print(f"[-] No matching HackerOne programs found for {domain} or its variations")
+            print(f"[-] No matching bug bounty programs found for {domain} or its variations")
             
         return matches
 
-    def scan_and_save(self):
-        start_time = datetime.now(UTC)
-        print(f"\n[+] Starting scan at {start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    def check_web_for_bug_bounty(self, domain: str) -> Optional[Tuple[str, str]]:
+        """
+        Search the web for bug bounty programs associated with a domain.
         
-        # First, find WordPress sites
-        print("\n[+] Phase 1: Finding WordPress sites...")
-        wordpress_sites = self.get_wordpress_sites()
-        if self.result_limit:
-            wordpress_sites = wordpress_sites[:self.result_limit]  # Ensure limit is enforced
-        total_sites = len(wordpress_sites)
-        print(f"[+] Found {total_sites} WordPress sites to check")
-        
-        if not wordpress_sites:
-            print("[-] No WordPress sites found, exiting")
-            return
-        
-        # Next, fetch HackerOne programs
-        print("\n[+] Phase 2: Fetching HackerOne programs...")
-        hackerone_programs = self.get_hackerone_programs()
-        
-        if not hackerone_programs:
-            print("[-] No HackerOne programs found or error fetching programs")
-            return
+        Args:
+            domain (str): Domain to search for
             
-        # Now check each WordPress site
-        results = []
-        vulnerable_count = 0
-        h1_matches_count = 0
+        Returns:
+            Optional[Tuple[str, str]]: Tuple of (program_url, platform) if found, None otherwise
+        """
+        if self.interrupted:
+            return None
         
-        print(f"\n[+] Phase 3: Checking {total_sites} WordPress sites for wp-cron.php exposure...")
-        for i, (site_url, domain) in enumerate(wordpress_sites, 1):
-            print(f"\n[*] [{i}/{total_sites}] Checking {site_url}")
-            
-            # First check if the site is vulnerable
-            is_vulnerable = self.check_wp_cron(site_url)
-            
-            if is_vulnerable:
-                vulnerable_count += 1
-                print(f"[!] Vulnerable: {site_url}")
-                
-                # Then check if it's in scope for any HackerOne program
-                scope_matches = self.check_scope(site_url, hackerone_programs)
-                
-                if scope_matches:
-                    h1_matches_count += len(scope_matches)
-                    print(f"[!] Found {len(scope_matches)} HackerOne program matches:")
-                    for _, program_url in scope_matches:
-                        print(f"    → {program_url}")
-                        results.append({
-                            'vulnerable_url': site_url,
-                            'hackerone_program': program_url,
-                            'checked_at': datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                        })
-                else:
-                    print("[-] No HackerOne program matches found")
-            else:
-                print("[-] Not vulnerable to wp-cron.php exposure")
+        print(f"[*] Searching web for bug bounty programs: {domain}")
+        
+        # Remove www. and get base domain
+        base_domain = domain.replace('www.', '')
+        
+        # Common security page patterns
+        security_paths = [
+            '/security',
+            '/security.txt',
+            '/.well-known/security.txt',
+            '/responsible-disclosure',
+            '/bug-bounty',
+            '/bugbounty',
+            '/vulnerability-disclosure',
+            '/security-policy',
+            '/security/report',
+            '/whitehat',
+            '/responsible-vulnerability-disclosure',
+            '/security/bounty',
+            '/security/reward',
+            '/security-hall-of-fame',
+            '/hall-of-fame',
+            '/hackerone.txt',
+            '/bug-report',
+            '/security/report-vulnerability',
+            '/security/disclosure',
+            '/security/researchers',
+            '/security/reporting',
+            '/security/report-issue',
+            '/security/bug-bounty',
+            '/security/vulnerability',
+            '/security/responsible-disclosure',
+            '/security/bug-reporting',
+            '/security/report-security-issue',
+            '/security/vulnerability-reporting'
+        ]
+        
+        # Common bug bounty platforms to check (removed Federacy)
+        bounty_platforms = {
+            'Bugcrowd': [
+                f'https://bugcrowd.com/{base_domain}',
+                f'https://bugcrowd.com/programs/{base_domain}'
+            ],
+            'YesWeHack': [
+                f'https://yeswehack.com/programs/{base_domain}',
+                f'https://yeswehack.com/programs/search?query={base_domain}'
+            ],
+            'Open Bug Bounty': [
+                f'https://www.openbugbounty.org/bugbounty/{base_domain}/',
+                f'https://www.openbugbounty.org/search/?search={base_domain}'
+            ],
+            'Immunefi': [
+                f'https://immunefi.com/bounty/{base_domain}/',
+                f'https://immunefi.com/explore/'
+            ],
+            'Hackenproof': [
+                f'https://hackenproof.com/programs/{base_domain}',
+                f'https://hackenproof.com/{base_domain}'
+            ],
+            'Safehats': [
+                f'https://safehats.com/program/{base_domain}',
+                f'https://safehats.com/programs/{base_domain}'
+            ],
+            'BountyFactory': [
+                f'https://bountyfactory.io/program/{base_domain}',
+                f'https://bountyfactory.io/company/{base_domain}'
+            ],
+            'Bugbounter': [
+                f'https://www.bugbounter.com/program/{base_domain}',
+                f'https://www.bugbounter.com/programs/{base_domain}'
+            ]
+        }
+        
+        # Keywords to identify bug bounty/security programs
+        bounty_keywords = [
+            'bug bounty',
+            'security bounty',
+            'vulnerability reward',
+            'security reward',
+            'responsible disclosure',
+            'vulnerability disclosure',
+            'security disclosure',
+            'report vulnerability',
+            'report security',
+            'security policy',
+            'security response',
+            'bug report',
+            'vulnerability report',
+            'hall of fame',
+            'security researchers',
+            'security research',
+            'security contact',
+            'security@',
+            'hackerone.com',
+            'bugcrowd.com',
+            'yeswehack.com',
+            'immunefi.com',
+            'openbugbounty.org',
+            'hackenproof.com',
+            'safehats.com',
+            'bountyfactory.io',
+            'bugbounter.com'
+        ]
 
-        # Save results to CSV if we found any matches
-        if results:
-            filename = f"wpdecronifier_results_{start_time.strftime('%Y%m%d_%H%M%S_UTC')}.csv"
-            with open(filename, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['vulnerable_url', 'hackerone_program', 'checked_at'])
-                writer.writeheader()
-                writer.writerows(results)
-                print(f"\n[+] Results saved to {filename}")
-                
-        # Print final summary
-        print("\n[+] Scan Summary:")
-        print(f"    • Total WordPress sites checked: {total_sites}")
-        print(f"    • Vulnerable sites found: {vulnerable_count}")
-        print(f"    • Sites with HackerOne matches: {h1_matches_count}")
+        # Additional security indicators
+        security_indicators = [
+            'vulnerability reward program',
+            'security vulnerability',
+            'report security vulnerability',
+            'security issue',
+            'report security issue',
+            'security researcher',
+            'security research program',
+            'vulnerability reporting',
+            'bug reporting',
+            'security reporting',
+            'vulnerability management',
+            'responsible disclosure policy',
+            'coordinated disclosure',
+            'security acknowledgments',
+            'security acknowledgements',
+            'security credits',
+            'security wall of fame',
+            'vulnerability management program',
+            'bug hunter',
+            'security researcher program',
+            'vulnerability coordination',
+            'vulnerability handling',
+            'vulnerability submission',
+            'security submissions',
+            'vulnerability rewards',
+            'security rewards'
+        ]
         
-        if h1_matches_count > 0:
-            print("\n[!] HackerOne Program Matches:")
-            seen_matches = set()
-            for result in results:
-                match_key = f"{result['vulnerable_url']} → {result['hackerone_program']}"
-                if match_key not in seen_matches:
-                    seen_matches.add(match_key)
-                    print(f"    • {match_key}")
-        elif vulnerable_count > 0:
-            print("\n[-] Found vulnerable sites but none matched HackerOne programs")
-        else:
-            print("\n[-] No vulnerable sites found")
+        try:
+            # First check security.txt locations
+            for path in security_paths:
+                if self.interrupted:
+                    return None
+                
+                url = f"https://{domain}{path}"
+                try:
+                    response = self.session.get(url, timeout=5, verify=False)
+                    if response.status_code == 200:
+                        content = response.text.lower()
+                        # Look for bug bounty related keywords and security indicators
+                        found_keywords = [k for k in bounty_keywords + security_indicators if k in content]
+                        if found_keywords:
+                            print(f"[+] Found security page: {url}")
+                            print(f"[+] Matched keywords: {found_keywords}")
+                            
+                            # Check for specific platform references in the content
+                            for platform, _ in bounty_platforms.items():
+                                if platform.lower() in content:
+                                    print(f"[+] Found reference to {platform} platform")
+                                    return (url, platform)
+                            
+                            # If no specific platform found but has security content
+                            if len(found_keywords) >= 2:  # Require at least 2 matching keywords for higher confidence
+                                return (url, "Self-Hosted")
+                except KeyboardInterrupt:
+                    self.interrupted = True
+                    print("\n\n[!] Search interrupted by user")
+                    return None
+                except:
+                    continue
+                    
+            # Check bug bounty platforms
+            for platform, urls in bounty_platforms.items():
+                if self.interrupted:
+                    return None
+                
+                for url in urls:
+                    try:
+                        response = self.session.get(url, timeout=5, verify=False, allow_redirects=True)
+                        if response.status_code == 200:
+                            content = response.text.lower()
+                            # Check if it's an actual program page
+                            if base_domain.lower() in content:
+                                # Look for multiple security indicators for higher confidence
+                                found_keywords = [k for k in bounty_keywords + security_indicators if k in content]
+                                if len(found_keywords) >= 2:  # Require at least 2 matching keywords
+                                    print(f"[+] Found {platform} program: {url}")
+                                    print(f"[+] Matched keywords: {found_keywords}")
+                                    return (url, platform)
+                    except KeyboardInterrupt:
+                        self.interrupted = True
+                        print("\n\n[!] Search interrupted by user")
+                        return None
+                    except:
+                        continue
+                    
+            # Check main domain for security page links
+            try:
+                if self.interrupted:
+                    return None
+                
+                response = self.session.get(f"https://{domain}", timeout=5, verify=False)
+                if response.status_code == 200:
+                    content = response.text.lower()
+                    # First check for security-related keywords
+                    found_keywords = [k for k in bounty_keywords + security_indicators if k in content]
+                    if found_keywords:
+                        print(f"[+] Found security-related content on main page")
+                        print(f"[+] Matched keywords: {found_keywords}")
+                        
+                        # Check for specific platform references
+                        for platform, _ in bounty_platforms.items():
+                            if platform.lower() in content:
+                                print(f"[+] Found reference to {platform} platform")
+                                # Try to extract the specific program URL
+                                for url in urls:
+                                    if url.lower() in content:
+                                        return (url, platform)
+                        
+                        # Then check for security page references
+                        for path in security_paths:
+                            if path in content:
+                                security_url = f"https://{domain}{path}"
+                                # Verify the security page exists
+                                try:
+                                    sec_response = self.session.get(security_url, timeout=5, verify=False)
+                                    if sec_response.status_code == 200:
+                                        sec_content = sec_response.text.lower()
+                                        # Require multiple security indicators for higher confidence
+                                        found_sec_keywords = [k for k in bounty_keywords + security_indicators if k in sec_content]
+                                        if len(found_sec_keywords) >= 2:
+                                            print(f"[+] Found security page: {security_url}")
+                                            print(f"[+] Matched keywords: {found_sec_keywords}")
+                                            return (security_url, "Self-Hosted")
+                                except:
+                                    continue
+            except KeyboardInterrupt:
+                self.interrupted = True
+                print("\n\n[!] Search interrupted by user")
+                return None
+            except:
+                pass
+                
+            if not self.interrupted:
+                print(f"[-] No bug bounty program found for {domain}")
+            return None
+            
+        except KeyboardInterrupt:
+            self.interrupted = True
+            print("\n\n[!] Search interrupted by user")
+            return None
+        except Exception as e:
+            print(f"[-] Error searching for bug bounty programs: {str(e)}")
+            return None
+
+    def _is_cache_valid(self, cache_file: str) -> bool:
+        """
+        Check if the cache file exists and is still valid.
+        
+        Args:
+            cache_file (str): Path to the cache file
+            
+        Returns:
+            bool: True if cache is valid, False otherwise
+        """
+        try:
+            if not os.path.exists(cache_file):
+                return False
+                
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+                
+            # Check if cache has required fields
+            if 'timestamp' not in cache_data or 'data' not in cache_data:
+                return False
+                
+            # Parse cache timestamp
+            cache_time = datetime.fromisoformat(cache_data['timestamp'].replace('Z', '+00:00'))
+            current_time = datetime.now(UTC)
+            
+            # Check if cache is still valid and has data
+            return (current_time - cache_time) < self.cache_duration and len(cache_data.get('data', [])) > 0
+                
+        except Exception as e:
+            print(f"[-] Error checking cache validity: {str(e)}")
+            return False
+
+    def _save_to_cache(self, data: Union[List[dict], dict], cache_file: str) -> None:
+        """
+        Save API response data to cache file.
+        
+        Args:
+            data (Union[List[dict], dict]): Data to cache. Can be either a list of programs or a dict with timestamp and data
+            cache_file (str): Path to the cache file
+        """
+        try:
+            # Ensure cache directory exists
+            cache_dir = os.path.dirname(cache_file)
+            os.makedirs(cache_dir, exist_ok=True)
+            
+            # Prepare cache data
+            if isinstance(data, list):
+                # If data is a list, wrap it in the expected format
+                cache_data = {
+                    'timestamp': datetime.now(UTC).isoformat(),
+                    'data': data
+                }
+            else:
+                # If data is already in the correct format, use it as is
+                cache_data = data
+            
+            # Write to a temporary file first
+            temp_file = f"{cache_file}.tmp"
+            try:
+                with open(temp_file, 'w') as f:
+                    json.dump(cache_data, f, indent=2)
+                
+                # If write was successful, rename to final filename
+                os.replace(temp_file, cache_file)
+                print(f"[+] Cache updated: {cache_file}")
+                print(f"[+] Cached {len(cache_data['data'])} programs")
+            except Exception as e:
+                print(f"[-] Error writing cache file: {str(e)}")
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                raise
+        except Exception as e:
+            print(f"[-] Error saving to cache: {str(e)}")
+
+    def _load_from_cache(self, cache_file: str) -> Optional[List[dict]]:
+        """
+        Load data from cache file.
+        
+        Args:
+            cache_file (str): Path to the cache file
+            
+        Returns:
+            Optional[List[dict]]: Cached data if valid, None otherwise
+        """
+        try:
+            if not self._is_cache_valid(cache_file):
+                return None
+                
+            with open(cache_file, 'r') as f:
+                cache_data = json.load(f)
+                
+            return cache_data['data']
+            
+        except Exception as e:
+            print(f"[-] Error loading cache: {str(e)}")
+            return None
 
 def main():
     """
@@ -765,11 +1468,16 @@ def main():
     # Set up logging
     log_filename = setup_logging(start_time)
     
-    # Check for HackerOne environment variables
+    # Create cache directory if it doesn't exist
+    cache_dir = os.path.join(os.getcwd(), 'api_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # Check for required environment variables
     missing_vars = []
     env_vars = {
         'H1_TOKEN': 'HackerOne API Token',
-        'H1_USERNAME': 'HackerOne Username'
+        'H1_USERNAME': 'HackerOne Username',
+        'INTIGRITI_TOKEN': 'Intigriti API Token (required for Intigriti program matching)'
     }
 
     for var, description in env_vars.items():
@@ -779,7 +1487,8 @@ def main():
     if missing_vars:
         print("\n[-] Error: Missing required environment variables:")
         print("\n".join(missing_vars))
-        print("\nPlease set all required environment variables before running the script.")
+        print("\nAll environment variables (H1_TOKEN, H1_USERNAME, and INTIGRITI_TOKEN) are required.")
+        print("Please set all required environment variables before running the script.")
         return
 
     # Parse command line arguments
@@ -794,17 +1503,25 @@ def main():
             print("[-] Error: Result limit must be a valid number")
             return
 
-    # Initialize and run scanner
+    # Initialize scanner
+    scanner = None
     try:
         scanner = WordPressCronScanner(result_limit)
         scanner.scan_and_save()
         print(f"\n[+] Execution log appended to: {log_filename}")
     except KeyboardInterrupt:
-        print("\n[-] Scan interrupted by user")
+        print("\n\n[!] Keyboard interrupt received. Cleaning up...")
+        if scanner:
+            scanner.interrupted = True
+            scanner.save_progress(start_time)
+            scanner.cleanup()
+        print("\n[+] Cleanup complete. Exiting gracefully...")
     except Exception as e:
         print(f"\n[-] An unexpected error occurred: {str(e)}")
         import traceback
         traceback.print_exc()
+        if scanner:
+            scanner.cleanup()
 
 if __name__ == "__main__":
     main() 

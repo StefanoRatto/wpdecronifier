@@ -4,7 +4,11 @@ This utility scans for WordPress sites exposed to the internet and checks if the
 
 ## Features
 
-- Discovers WordPress sites using Common Crawl data (no Shodan API required)
+- Discovers WordPress sites using Common Crawl data:
+  - Automatically fetches and uses the latest Common Crawl index
+  - Fallback to recent stable index if latest is unavailable
+  - Shows collection dates and index information
+  - Smart caching of downloaded files
 - Intelligent WordPress site validation with multiple indicators:
   - WordPress-specific headers
   - wp-content/wp-includes patterns
@@ -127,8 +131,12 @@ The tool implements smart rate limiting:
 Two types of caching are implemented:
 1. API Response Cache:
    - 24-hour validity for bug bounty program data
-   - Stored in `hackerone_cache.json` and `intigriti_cache.json`
+   - Stored in `api_cache/` directory:
+     - `hackerone_programs.json` for HackerOne programs
+     - `intigriti_programs.json` for Intigriti programs
+   - Direct program data caching without timestamp wrapping
    - Reduces API calls and improves performance
+   - Automatic cache invalidation after 24 hours
 
 2. Common Crawl Cache:
    - Stores downloaded Common Crawl files locally
@@ -162,9 +170,10 @@ This tool is intended for security researchers and bug bounty hunters. Always en
 The tool operates in three phases:
 
 1. WordPress Site Discovery:
-   - Fetches and processes Common Crawl data
-   - Validates potential WordPress sites
+   - Fetches latest Common Crawl index information
+   - Downloads and processes Common Crawl data files
    - Uses parallel processing for faster discovery
+   - Validates potential WordPress sites
    - Respects the specified result limit
 
 2. Bug Bounty Program Fetching:
@@ -189,7 +198,7 @@ The tool operates in three phases:
 
 ## Limitations
 
-- Common Crawl data may not be completely up-to-date
+- Common Crawl data may not be completely up-to-date (but uses latest available index)
 - HackerOne API rate limits (Enterprise: 10k/day, default: 3.6k/day)
 - Intigriti API rate limits (standard limits apply)
 - Only considers direct 200 OK responses as vulnerable
@@ -198,11 +207,11 @@ The tool operates in three phases:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Feel free to submit issues, fork the repository, and create pull requests for any improvements.
 
-## Licensing
+## License
 
-The tool is licensed under the [GNU General Public License](https://www.gnu.org/licenses/gpl-3.0.en.html).
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Disclaimer
 
