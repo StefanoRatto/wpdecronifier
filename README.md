@@ -1,4 +1,4 @@
-# WordPress Cron Exposure Scanner (WPDecronifier)
+# WordPress Cron Exposure Scanner (wpdecronifier)
 
 This utility scans for WordPress sites exposed to the internet and checks if they have exposed wp-cron.php endpoints that could be potential security issues. It then cross-references these sites with both HackerOne and Intigriti public bug bounty programs to identify if any vulnerable sites are in scope for responsible disclosure.
 
